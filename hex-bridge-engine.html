@@ -1,0 +1,955 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Hex: play the bridge engine</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#f6f4ef;--ink:#1e2430;--mute:#6b7280;--line:#c9c3b6;--cell:#fffdf8;--red:#d6453d;--blue:#2f6fd6;--card:#fff}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+main{max-width:1180px;margin:0 auto;padding:20px;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:20px}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+h1{font-size:19px;margin:0 0 4px}.sub{color:var(--mute);margin:0 0 12px;font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+label{display:block;font-size:12px;color:var(--mute);margin:10px 0 4px}label:first-child{margin-top:0}
+select,button,textarea{font:inherit;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+button{cursor:pointer;font-weight:600}button.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+button:disabled{opacity:.45;cursor:default}.row{display:flex;gap:8px;margin-top:10px}
+#status{font-weight:600;min-height:22px;margin-bottom:8px}#status.red{color:var(--red)}#status.blue{color:var(--blue)}
+svg{width:100%;height:auto;display:block;touch-action:manipulation}
+.hex{fill:var(--cell);stroke:var(--line);stroke-width:1.2}.hex.ok{cursor:pointer}.hex.ok:hover{fill:#ece7da}
+.hex.r{fill:var(--red)}.hex.b{fill:var(--blue)}.hex.win{stroke:#111;stroke-width:3}
+.last{fill:none;stroke:#fff;stroke-width:2.5;pointer-events:none}.lab{font-size:11px;fill:var(--mute);text-anchor:middle;pointer-events:none}
+#moves{font:12px/1.6 ui-monospace,Menlo,monospace;max-height:150px;overflow:auto;color:var(--mute);word-break:break-word}
+.key{display:flex;gap:14px;font-size:12px;color:var(--mute);margin-top:8px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}
+</style></head><body><main>
+<section><h1>Hex: play the bridge engine or a friend</h1>
+<p class="sub">Red connects top to bottom and moves first. Blue connects left to right.</p>
+<div class="card"><div id="status">Loading</div><svg id="board" role="img" aria-label="Hex board"></svg>
+<div class="key"><span><span class="dot" style="background:var(--red)"></span>Red: top to bottom</span><span><span class="dot" style="background:var(--blue)"></span>Blue: left to right</span></div></div></section>
+<aside>
+<div class="card"><label for="size">Board</label><select id="size"><option value="11">11 × 11</option><option value="9">9 × 9</option></select>
+<label for="side">You play</label><select id="side"><option value="1">Red (first)</option><option value="2">Blue (second)</option></select>
+<label for="eng">Opponent</label><select id="eng"><option value="bv">Bridge engine (best so far)</option><option value="heuristic">Original heuristic</option><option value="human">Human vs human (same screen)</option></select>
+<label for="sims">Engine strength (simulations per move)</label><select id="sims"><option value="256">Quick · 256</option><option value="1024" selected>Normal · 1,024</option><option value="4096">Strong · 4,096</option><option value="16384">Strongest · 16,384 (slow)</option></select>
+<label for="swap">Swap rule</label><select id="swap"><option value="1">On</option><option value="0">Off</option></select>
+<div class="row"><button class="primary" id="new">New game</button></div>
+<div class="row"><button id="undo">Undo</button><button id="swapbtn" hidden>Swap</button></div>
+<div class="row"><button id="switch">Switch sides</button></div></div>
+<div class="card"><label>Moves</label><div id="moves"></div></div>
+<div class="card"><label for="note">Notes on this game</label><textarea id="note" rows="4"></textarea>
+<div class="row"><button id="save">Download game as a file</button></div><div class="sub" id="saved" style="margin:8px 0 0"></div></div>
+<div class="sub">Runs entirely in this file. Nothing is sent anywhere.</div></aside></main>
+<script id="engine-src" type="text/plain">
+/* Hex Learning: portable MLP inference (hex-mlp-v1). No DOM, network or extension APIs. */
+(function (root) {
+  'use strict';
+
+  var MAX_N = 11, CHANNELS = 6, HIDDEN = 64, INPUT = CHANNELS * MAX_N * MAX_N, POLICY = 122, SWAP = 121;
+  var EMPTY = 0, RED = 1, BLUE = 2;
+  var DIRS = [[-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0]];
+  var MAX_JSON_CHARS = 8 * 1024 * 1024;
+  var MAX_METADATA_CHARS = 64 * 1024;
+  var ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/;
+  var SHAPES = {
+    w1: [HIDDEN, INPUT], b1: [HIDDEN],
+    w2: [HIDDEN, HIDDEN], b2: [HIDDEN],
+    wp: [POLICY, HIDDEN], bp: [POLICY],
+    wv: [1, HIDDEN], bv: [1]
+  };
+  var TOP_KEYS = ['schema', 'id', 'architecture', 'maxN', 'channels', 'hidden', 'weights', 'metadata'];
+
+  function fail(msg) { throw new Error(msg); }
+  function isPlainObject(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
+  function sameKeys(obj, keys) {
+    var k = Object.keys(obj);
+    return k.length === keys.length && keys.every(function (x) { return Object.prototype.hasOwnProperty.call(obj, x); });
+  }
+
+  function flattenExact(name, value, shape) {
+    var total = shape.reduce(function (a, b) { return a * b; }, 1);
+    var out = new Float32Array(total);
+    var idx = 0;
+    function walk(v, depth) {
+      if (depth === shape.length) {
+        if (typeof v !== 'number' || !isFinite(v)) fail('weights.' + name + ' contains a non-finite or non-number value');
+        if (Math.abs(v) > 3.4e38) fail('weights.' + name + ' value exceeds float32 range');
+        out[idx++] = v;
+        return;
+      }
+      if (!Array.isArray(v) && !ArrayBuffer.isView(v)) fail('weights.' + name + ' must be an array');
+      if (v.length !== shape[depth]) {
+        if (depth === 0 && shape.length > 1 && v.length === total && typeof v[0] === 'number') {
+          for (var j = 0; j < total; j++) walk(v[j], shape.length);
+          return;
+        }
+        fail('weights.' + name + ' has length ' + v.length + ' at depth ' + depth + ', expected ' + shape[depth]);
+      }
+      for (var i = 0; i < v.length; i++) walk(v[i], depth + 1);
+    }
+    walk(value, 0);
+    if (idx !== total) fail('weights.' + name + ' expected ' + total + ' values, got ' + idx);
+    return out;
+  }
+
+  var validatedStates = new WeakSet();
+  function isValidated(s) { return s !== null && typeof s === 'object' && validatedStates.has(s); }
+  function markValidated(s) { validatedStates.add(s); return s; }
+
+  var prepared = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  function validateModel(model) {
+    if (prepared && model && typeof model === 'object' && prepared.has(model)) return prepared.get(model);
+    if (model && model.__hexNeuralPrepared === true) return model;
+    if (!isPlainObject(model)) fail('model must be a JSON object');
+    if (!sameKeys(model, TOP_KEYS)) fail('model keys must be exactly ' + TOP_KEYS.join(','));
+    if (model.schema !== 1) fail('unsupported schema ' + model.schema);
+    if (typeof model.id !== 'string' || !ID_RE.test(model.id)) fail('id must match [A-Za-z0-9_.-]{1,80}');
+    if (model.architecture !== 'hex-mlp-v1') fail('unsupported architecture');
+    if (model.maxN !== MAX_N) fail('maxN must be 11');
+    if (model.channels !== CHANNELS) fail('channels must be 6');
+    if (model.hidden !== HIDDEN) fail('hidden must be 64');
+    if (!isPlainObject(model.metadata)) fail('metadata must be an object');
+    var metaText;
+    try { metaText = JSON.stringify(model.metadata); } catch (e) { fail('metadata must be JSON-serializable'); }
+    if (metaText.length > MAX_METADATA_CHARS) fail('metadata too large');
+    if (!isPlainObject(model.weights)) fail('weights must be an object');
+    var names = Object.keys(SHAPES);
+    if (!sameKeys(model.weights, names)) fail('weights keys must be exactly ' + names.join(','));
+    var w = {};
+    names.forEach(function (k) { w[k] = flattenExact(k, model.weights[k], SHAPES[k]); });
+    var w1t = new Float32Array(INPUT * HIDDEN);
+    for (var h = 0; h < HIDDEN; h++) for (var i = 0; i < INPUT; i++) w1t[i * HIDDEN + h] = w.w1[h * INPUT + i];
+    var p = {
+      __hexNeuralPrepared: true,
+      id: model.id,
+      metadata: JSON.parse(metaText),
+      w1t: w1t, b1: w.b1, w2: w.w2, b2: w.b2, wp: w.wp, bp: w.bp, wv: w.wv, bv: w.bv
+    };
+    Object.freeze(p);
+    if (prepared) prepared.set(model, p);
+    return p;
+  }
+
+  function parseModel(text) {
+    if (typeof text !== 'string') fail('model JSON must be a string');
+    if (text.length > MAX_JSON_CHARS) fail('model JSON too large');
+    var obj;
+    try { obj = JSON.parse(text); } catch (e) { fail('malformed model JSON: ' + e.message); }
+    return validateModel(obj);
+  }
+
+  /* ---------------- rules ---------------- */
+
+  function winnerOf(grid, n) {
+    var red = connects(grid, n, RED), blue = connects(grid, n, BLUE);
+    if (red && blue) return -1;
+    return red ? RED : blue ? BLUE : 0;
+  }
+
+  function connects(grid, n, color) {
+    var seen = new Uint8Array(n * n), stack = [], i, r, c;
+    for (i = 0; i < n; i++) {
+      var s = color === RED ? i : i * n;
+      if (grid[s] === color) { seen[s] = 1; stack.push(s); }
+    }
+    while (stack.length) {
+      var cur = stack.pop();
+      r = (cur / n) | 0; c = cur % n;
+      if (color === RED ? r === n - 1 : c === n - 1) return true;
+      for (var d = 0; d < 6; d++) {
+        var rr = r + DIRS[d][0], cc = c + DIRS[d][1];
+        if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+        var j = rr * n + cc;
+        if (!seen[j] && grid[j] === color) { seen[j] = 1; stack.push(j); }
+      }
+    }
+    return false;
+  }
+
+  /* Empty cells where `color` connects its two edges immediately. */
+  function winningCells(grid, n, color) {
+    var a = reach(grid, n, color, 0), b = reach(grid, n, color, 1), out = [];
+    for (var i = 0; i < n * n; i++) {
+      if (grid[i] !== EMPTY) continue;
+      var r = (i / n) | 0, c = i % n;
+      var line = color === RED ? r : c;
+      var ta = line === 0, tb = line === n - 1;
+      for (var d = 0; d < 6 && !(ta && tb); d++) {
+        var rr = r + DIRS[d][0], cc = c + DIRS[d][1];
+        if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+        var j = rr * n + cc;
+        if (a[j]) ta = true;
+        if (b[j]) tb = true;
+      }
+      if (ta && tb) out.push(i);
+    }
+    return out;
+  }
+
+  function reach(grid, n, color, far) {
+    var seen = new Uint8Array(n * n), stack = [];
+    for (var i = 0; i < n; i++) {
+      var line = far ? n - 1 : 0;
+      var s = color === RED ? line * n + i : i * n + line;
+      if (grid[s] === color) { seen[s] = 1; stack.push(s); }
+    }
+    while (stack.length) {
+      var cur = stack.pop(), r = (cur / n) | 0, c = cur % n;
+      for (var d = 0; d < 6; d++) {
+        var rr = r + DIRS[d][0], cc = c + DIRS[d][1];
+        if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+        var j = rr * n + cc;
+        if (!seen[j] && grid[j] === color) { seen[j] = 1; stack.push(j); }
+      }
+    }
+    return seen;
+  }
+
+  function readGrid(state) {
+    var n = state.n, g = state.grid;
+    if ((!Array.isArray(g) && !ArrayBuffer.isView(g)) || g.length !== n * n) fail('grid must be a list of n*n integers');
+    var out = new Uint8Array(n * n);
+    for (var i = 0; i < n * n; i++) out[i] = cellValue(g[i]);
+    return out;
+  }
+  function cellValue(v) {
+    if (v !== 0 && v !== 1 && v !== 2) fail('grid cells must be 0, 1 or 2');
+    return v;
+  }
+
+  var STATE_KEYS = ['n', 'grid', 'toMove', 'ply', 'swapEnabled', 'swapAvailable'];
+
+  /*
+   * Mirrors backend rules.state_from_json. Without swap, RED leads by 0/1 and ply equals the stone
+   * count; after a swap BLUE leads by 0/1 and ply equals stones + 1 (the swap is a ply).
+   * swapAvailable must equal the rule-derived value. Additionally rejects wins that must have
+   * existed before the last move.
+   */
+  function validateState(state) {
+    if (!isPlainObject(state)) fail('state must be an object');
+    if (!sameKeys(state, STATE_KEYS)) fail('state keys must be exactly ' + STATE_KEYS.join(','));
+    var n = state.n;
+    if (!Number.isInteger(n) || n < 3 || n > MAX_N) fail('n must be an integer 3..11');
+    var grid = readGrid(state);
+    var toMove = state.toMove;
+    if (toMove !== RED && toMove !== BLUE) fail('toMove must be 1 (RED) or 2 (BLUE)');
+    var ply = state.ply;
+    if (!Number.isInteger(ply) || ply < 0 || ply > n * n + 1) fail('ply out of range');
+    var swapEnabled = state.swapEnabled, swapAvailable = state.swapAvailable;
+    if (typeof swapEnabled !== 'boolean' || typeof swapAvailable !== 'boolean') fail('swapEnabled and swapAvailable must be booleans');
+    var red = 0, blue = 0;
+    for (var i = 0; i < grid.length; i++) { if (grid[i] === RED) red++; else if (grid[i] === BLUE) blue++; }
+    var stones = red + blue;
+    var normal = toMove === RED ? red === blue : red === blue + 1;
+    var swapped = swapEnabled && stones >= 1 && (toMove === RED ? blue === red + 1 : blue === red);
+    if (!((normal && ply === stones) || (swapped && ply === stones + 1))) fail('stone counts, toMove and ply are inconsistent');
+    var derived = swapEnabled && ply === 1 && toMove === BLUE && red === 1 && blue === 0;
+    if (swapAvailable !== derived) fail('swapAvailable does not match the rules for this position');
+    var winner = winnerOf(grid, n);
+    if (winner === -1) fail('both colours connected');
+    if (winner) {
+      if (winner === toMove) fail('the winner cannot also be the player to move');
+      var breakable = false;
+      for (var j = 0; j < grid.length && !breakable; j++) {
+        if (grid[j] !== winner) continue;
+        grid[j] = EMPTY;
+        if (!connects(grid, n, winner)) breakable = true;
+        grid[j] = winner;
+      }
+      if (!breakable) fail('game would already have ended before the last move');
+    } else if (stones === n * n) {
+      fail('full board without a winner is impossible');
+    }
+    return markValidated({
+      n: n, grid: grid, toMove: toMove, ply: ply,
+      swapEnabled: swapEnabled, swapAvailable: swapAvailable, winner: winner
+    });
+  }
+
+  function legalActions(state) {
+    var s = normalized(state);
+    if (s.winner) return [];
+    var out = [];
+    for (var i = 0; i < s.grid.length; i++) if (s.grid[i] === EMPTY) out.push(i);
+    if (s.swapAvailable) out.push(SWAP);
+    return out;
+  }
+
+  function normalized(state) {
+    return isValidated(state) ? state : validateState(state);
+  }
+
+  /* Pure transition; returns a new normalized state. */
+  function applyAction(state, action) {
+    var s = normalized(state);
+    if (s.winner) fail('game is over');
+    var g = new Uint8Array(s.grid), n = s.n, next;
+    if (action === SWAP) {
+      if (!s.swapAvailable) fail('swap is not available');
+      var at = -1;
+      for (var i = 0; i < g.length; i++) if (g[i] === RED) at = i;
+      var r = (at / n) | 0, c = at % n;
+      g[at] = EMPTY;
+      g[c * n + r] = BLUE;
+      next = { n: n, grid: g, toMove: RED, ply: 2, swapEnabled: s.swapEnabled, swapAvailable: false };
+    } else {
+      if (!Number.isInteger(action) || action < 0 || action >= n * n) fail('action out of range: ' + action);
+      if (g[action] !== EMPTY) fail('cell ' + action + ' is occupied');
+      g[action] = s.toMove;
+      var ply = s.ply + 1;
+      var swapNow = s.swapEnabled && s.toMove === RED && ply === 1;
+      next = { n: n, grid: g, toMove: 3 - s.toMove, ply: ply, swapEnabled: s.swapEnabled, swapAvailable: swapNow };
+    }
+    next.winner = winnerOf(g, n);
+    return markValidated(next);
+  }
+
+  /* ---------------- encoding / inference ---------------- */
+
+  function encodeInto(n, grid, toMove, swapAvailable, out) {
+    out.fill(0);
+    var plane = MAX_N * MAX_N, opp = 3 - toMove;
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        var p = r * MAX_N + c, v = grid[r * n + c];
+        if (v === toMove) out[p] = 1;
+        else if (v === opp) out[plane + p] = 1;
+        out[2 * plane + p] = 1;
+        var line = toMove === RED ? r : c;
+        if (line === 0) out[3 * plane + p] = 1;
+        if (line === n - 1) out[4 * plane + p] = 1;
+        if (swapAvailable) out[5 * plane + p] = 1;
+      }
+    }
+    return out;
+  }
+
+  function encode(state) {
+    var s = normalized(state);
+    return encodeInto(s.n, s.grid, s.toMove, s.swapAvailable, new Float32Array(INPUT));
+  }
+
+  function makeScratch() {
+    return { input: new Float32Array(INPUT), h1: new Float32Array(HIDDEN), h2: new Float32Array(HIDDEN), logits: new Float32Array(POLICY) };
+  }
+
+  /* Forward pass over an already-encoded input. Exploits input sparsity via transposed W1. */
+  function forward(p, input, scratch) {
+    var h1 = scratch.h1, h2 = scratch.h2, logits = scratch.logits, i, j, k;
+    h1.set(p.b1);
+    for (i = 0; i < INPUT; i++) {
+      var x = input[i];
+      if (x === 0) continue;
+      var base = i * HIDDEN;
+      for (j = 0; j < HIDDEN; j++) h1[j] += x * p.w1t[base + j];
+    }
+    for (j = 0; j < HIDDEN; j++) if (h1[j] < 0) h1[j] = 0;
+    for (j = 0; j < HIDDEN; j++) {
+      var acc = p.b2[j], row = j * HIDDEN;
+      for (k = 0; k < HIDDEN; k++) acc += p.w2[row + k] * h1[k];
+      h2[j] = acc > 0 ? acc : 0;
+    }
+    for (j = 0; j < POLICY; j++) {
+      var a = p.bp[j], prow = j * HIDDEN;
+      for (k = 0; k < HIDDEN; k++) a += p.wp[prow + k] * h2[k];
+      logits[j] = a;
+    }
+    var v = p.bv[0];
+    for (k = 0; k < HIDDEN; k++) v += p.wv[k] * h2[k];
+    return Math.tanh(v);
+  }
+
+  function policyIndex(action, n) {
+    return action === SWAP ? SWAP : ((action / n) | 0) * MAX_N + (action % n);
+  }
+
+  /* Softmax over the given legal actions only; returns Float64Array aligned with `actions`. */
+  function maskedSoftmax(logits, actions, n) {
+    var out = new Float64Array(actions.length), max = -Infinity, i;
+    for (i = 0; i < actions.length; i++) {
+      out[i] = logits[policyIndex(actions[i], n)];
+      if (out[i] > max) max = out[i];
+    }
+    var sum = 0;
+    for (i = 0; i < actions.length; i++) { out[i] = Math.exp(out[i] - max); sum += out[i]; }
+    for (i = 0; i < actions.length; i++) out[i] /= sum;
+    return out;
+  }
+
+  function infer(model, state) {
+    var p = validateModel(model);
+    var s = normalized(state);
+    var actions = legalActions(s);
+    if (!actions.length) return { policy: [], value: -1, terminal: true, winner: s.winner, modelId: p.id };
+    var scratch = makeScratch();
+    encodeInto(s.n, s.grid, s.toMove, s.swapAvailable, scratch.input);
+    var value = forward(p, scratch.input, scratch);
+    var probs = maskedSoftmax(scratch.logits, actions, s.n);
+    var policy = actions.map(function (a, i) { return { action: a, probability: probs[i] }; });
+    policy.sort(function (x, y) { return y.probability - x.probability || x.action - y.action; });
+    return { policy: policy, value: value, modelId: p.id };
+  }
+
+  var api = {
+    MAX_N: MAX_N, CHANNELS: CHANNELS, HIDDEN: HIDDEN, INPUT: INPUT, POLICY: POLICY, SWAP: SWAP,
+    EMPTY: EMPTY, RED: RED, BLUE: BLUE, DIRS: DIRS,
+    validateModel: validateModel, parseModel: parseModel,
+    validateState: validateState, isValidatedState: isValidated, legalActions: legalActions, applyAction: applyAction,
+    winnerOf: winnerOf, winningCells: winningCells,
+    encode: encode, infer: infer, policyIndex: policyIndex,
+    _internal: { encodeInto: encodeInto, forward: forward, makeScratch: makeScratch, maskedSoftmax: maskedSoftmax }
+  };
+  Object.freeze(api);
+  root.HexNeural = api;
+  if (typeof module === 'object' && module && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+// hex-heuristic.js - port of hex-learning search.py: HeuristicEvaluator (0-1 BFS shortest
+// connection) driving deterministic, noise-free PUCT with the same exact tactics. Only a terminal
+// position, a one-move win and an unanswerable double threat are ever proofs; all else is an
+// estimate. Pure computation: no DOM, network, storage, chrome.* or game input.
+globalThis.HexHeuristic = (() => {
+  'use strict';
+  const ID = 'heuristic-fallback';
+  const EMPTY = 0, RED = 1, BLUE = 2, SWAP = 121, MIN_N = 3, MAX_N = 11;
+  const BIG = 1e6, C_PUCT = 1.5, MAX_SIMS = 200000, MAX_MS = 5000, DEFAULT_MS = 400;
+  const TACTICAL_MIN_MS = 20, TACTICAL_MAX_MS = 60, TACTICAL_SHARE = 0.3;
+  const LIVE_BRIDGE = true; // live coach default: bridge-aware value (set false to restore the plain heuristic)
+  const EST_FLOOR = 0.05, EST_CEIL = 0.95, MAX_ALTERNATIVES = 4, MAX_PRIORS = 8;
+  const DIRS = [[-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0]];
+  const now = () => (globalThis.performance && performance.now ? performance.now() : Date.now());
+  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+  const other = c => (c === RED ? BLUE : RED);
+  const keyOf = (n, i) => ((i / n) | 0) + ',' + (i % n);
+  // CPython >= 3.12 sum() over floats is Neumaier-compensated; plain += drifts from Python by ulps.
+  function pySum(xs) {
+    let s = 0, c = 0;
+    for (const x of xs) {
+      const t = s + x;
+      c += Math.abs(s) >= Math.abs(x) ? (s - t) + x : (x - t) + s;
+      s = t;
+    }
+    return c && Number.isFinite(c) ? s + c : s;
+  }
+
+  function runtime() {
+    const N = globalThis.HexNeural;
+    if (!N || typeof N.validateState !== 'function') throw new Error('HexHeuristic needs hex-neural.js (HexNeural) loaded first');
+    return N;
+  }
+
+  const nbCache = new Map();
+  function neighbours(n) {
+    let a = nbCache.get(n);
+    if (a) return a;
+    a = [];
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+      const l = [];
+      for (const [dr, dc] of DIRS) { const rr = r + dr, cc = c + dc; if (rr >= 0 && rr < n && cc >= 0 && cc < n) l.push(rr * n + cc); }
+      a.push(l);
+    }
+    nbCache.set(n, a);
+    return a;
+  }
+
+  function edgeCells(n, color, fromA) {
+    const out = [];
+    for (let k = 0; k < n; k++) out.push(color === RED ? (fromA ? k : (n - 1) * n + k) : (fromA ? k * n : k * n + n - 1));
+    return out;
+  }
+
+  // Growable ring deque; distances from 0-1 BFS do not depend on visit order.
+  function edgeDist(grid, n, color, fromA) {
+    const size = n * n, opp = other(color), d = new Array(size).fill(BIG), nb = neighbours(n);
+    let cap = 4 * size, buf = new Int32Array(cap), head = 0, len = 0;
+    const grow = () => { const b = new Int32Array(cap * 2); for (let k = 0; k < len; k++) b[k] = buf[(head + k) % cap]; buf = b; head = 0; cap *= 2; };
+    const pushFront = i => { if (len === cap) grow(); head = (head - 1 + cap) % cap; buf[head] = i; len++; };
+    const pushBack = i => { if (len === cap) grow(); buf[(head + len) % cap] = i; len++; };
+    for (const i of edgeCells(n, color, fromA)) {
+      if (grid[i] === opp) continue;
+      const c = grid[i] === color ? 0 : 1;
+      if (c < d[i]) { d[i] = c; if (c === 0) pushFront(i); else pushBack(i); }
+    }
+    while (len) {
+      const u = buf[head]; head = (head + 1) % cap; len--;
+      const du = d[u];
+      for (const v of nb[u]) {
+        if (grid[v] === opp) continue;
+        const c = grid[v] === color ? 0 : 1;
+        if (du + c < d[v]) { d[v] = du + c; if (c === 0) pushFront(v); else pushBack(v); }
+      }
+    }
+    return d;
+  }
+
+  function potential(grid, n, color) {
+    const a = edgeDist(grid, n, color, true), b = edgeDist(grid, n, color, false), opp = other(color);
+    const tot = new Array(n * n);
+    let best = BIG;
+    for (let i = 0; i < n * n; i++) {
+      const t = a[i] >= BIG || b[i] >= BIG ? BIG : a[i] + b[i] - (grid[i] === color ? 0 : 1);
+      tot[i] = t;
+      if (grid[i] !== opp && t < best) best = t;
+    }
+    return { tot, best };
+  }
+
+  // ---- bridge-aware distance (port of hex-improve engines.py BridgeEvaluator, value only) ----
+  // A step may also cross an intact bridge (two empty common neighbours) or an edge template
+  // (second-line cell with both edge cells empty) at the same cost as a plain step.
+  const brCache = new Map();
+  function bridgeTable(n) {
+    let t = brCache.get(n);
+    if (t) return t;
+    const nb = neighbours(n);
+    t = [];
+    for (let u = 0; u < n * n; u++) {
+      const nu = new Set(nb[u]), cands = new Set();
+      for (const w of nb[u]) for (const v of nb[w]) if (v !== u && !nu.has(v)) cands.add(v);
+      const row = [];
+      for (const v of Array.from(cands).sort((a, b) => a - b)) {
+        const common = nb[v].filter(x => nu.has(x)).sort((a, b) => a - b);
+        if (common.length === 2) row.push([v, common[0], common[1]]);
+      }
+      t.push(row);
+    }
+    brCache.set(n, t);
+    return t;
+  }
+
+  function edgeTemplates(n, color, fromA) {
+    const out = [];
+    if (color === RED) {
+      if (fromA) for (let c = 0; c < n - 1; c++) out.push([n + c, c, c + 1]);
+      else for (let c = 1; c < n; c++) out.push([(n - 2) * n + c, (n - 1) * n + c - 1, (n - 1) * n + c]);
+    } else if (fromA) for (let r = 0; r < n - 1; r++) out.push([r * n + 1, r * n, (r + 1) * n]);
+    else for (let r = 1; r < n; r++) out.push([r * n + n - 2, (r - 1) * n + n - 1, r * n + n - 1]);
+    return out;
+  }
+
+  function bridgeEdgeDist(grid, n, color, fromA) {
+    const size = n * n, opp = other(color), d = new Array(size).fill(BIG), nb = neighbours(n), br = bridgeTable(n);
+    let cap = 8 * size, buf = new Int32Array(cap), head = 0, len = 0;
+    const grow = () => { const b = new Int32Array(cap * 2); for (let k = 0; k < len; k++) b[k] = buf[(head + k) % cap]; buf = b; head = 0; cap *= 2; };
+    const pushFront = i => { if (len === cap) grow(); head = (head - 1 + cap) % cap; buf[head] = i; len++; };
+    const pushBack = i => { if (len === cap) grow(); buf[(head + len) % cap] = i; len++; };
+    const seed = i => { const c = grid[i] === color ? 0 : 1; if (c < d[i]) { d[i] = c; if (c === 0) pushFront(i); else pushBack(i); } };
+    for (const i of edgeCells(n, color, fromA)) if (grid[i] !== opp) seed(i);
+    for (const [i, e1, e2] of edgeTemplates(n, color, fromA)) if (grid[i] !== opp && grid[e1] === EMPTY && grid[e2] === EMPTY) seed(i);
+    const relax = (du, v) => {
+      if (grid[v] === color) { if (du < d[v]) { d[v] = du; pushFront(v); } }
+      else if (du + 1 < d[v]) { d[v] = du + 1; pushBack(v); }
+    };
+    while (len) {
+      const u = buf[head]; head = (head + 1) % cap; len--;
+      const du = d[u];
+      for (const v of nb[u]) if (grid[v] !== opp) relax(du, v);
+      for (const [v, c1, c2] of br[u]) if (grid[v] !== opp && grid[c1] === EMPTY && grid[c2] === EMPTY) relax(du, v);
+    }
+    return d;
+  }
+
+  function bridgeBest(grid, n, color) {
+    const a = bridgeEdgeDist(grid, n, color, true), b = bridgeEdgeDist(grid, n, color, false), opp = other(color);
+    let best = BIG;
+    for (let i = 0; i < n * n; i++) {
+      if (grid[i] === opp || a[i] >= BIG || b[i] >= BIG) continue;
+      const t = a[i] + b[i] - (grid[i] === color ? 0 : 1);
+      if (t < best) best = t;
+    }
+    return best;
+  }
+
+  // Returns priors aligned with `actions` (Python dict order: cells, then SWAP) and a value for s.toMove.
+  // bridge=true: priors unchanged, value from the bridge-aware distance (the confirmed BV engine).
+  function evaluateRaw(s, actions, bridge) {
+    const n = s.n, g = s.grid, me = s.toMove;
+    const mine = potential(g, n, me), theirs = potential(g, n, other(me));
+    const mid = (n - 1) / 2, order = [], scores = [];
+    for (const a of actions) {
+      if (a === SWAP) continue;
+      const r = (a / n) | 0, c = a % n;
+      const m = mine.tot[a] >= BIG ? 40 : mine.tot[a] - mine.best;
+      const y = theirs.tot[a] >= BIG ? 40 : theirs.tot[a] - theirs.best;
+      order.push(a); scores.push(-(m + 0.9 * y) - 0.15 * (Math.abs(r - mid) + Math.abs(c - mid)));
+    }
+    if (actions.includes(SWAP)) {
+      let at = -1;
+      for (let i = 0; i < g.length; i++) if (g[i] === RED) { at = i; break; }
+      const r = (at / n) | 0, c = at % n;
+      const central = Math.abs(r - mid) + Math.abs(c - mid) <= n / 3;
+      let top = 0.0;
+      if (scores.length) { top = -Infinity; for (const v of scores) if (v > top) top = v; }
+      order.push(SWAP); scores.push(central ? top + 0.5 : top - 3.0);
+    }
+    let mx = -Infinity;
+    for (const v of scores) if (v > mx) mx = v;
+    const ex = scores.map(v => Math.exp(v - mx));
+    const z = pySum(ex);
+    const byAction = new Map();
+    order.forEach((a, k) => byAction.set(a, ex[k] / z));
+    const myBest = bridge ? bridgeBest(g, n, me) : mine.best, theirBest = bridge ? bridgeBest(g, n, other(me)) : theirs.best;
+    const mb = myBest >= BIG ? BIG : myBest, tb = theirBest >= BIG ? BIG : theirBest;
+    const value = Math.tanh(0.4 * (Math.min(tb, 3 * n) - Math.min(mb, 3 * n) + 0.5));
+    return { byAction, value };
+  }
+
+  function tactics(N, s) {
+    if (s.winner) return { exact: s.winner === s.toMove ? 1 : -1, allowed: [], kind: 'terminal' };
+    const legal = N.legalActions(s);
+    const wins = N.winningCells(s.grid, s.n, s.toMove);
+    if (wins.length) return { exact: 1, allowed: wins, kind: 'win-in-1' };
+    const threats = N.winningCells(s.grid, s.n, other(s.toMove));
+    if (threats.length >= 2) return { exact: -1, allowed: legal, kind: 'double-threat' };
+    if (threats.length === 1) return { exact: null, allowed: threats, kind: 'forced-block' };
+    return { exact: null, allowed: legal, kind: null };
+  }
+
+  function Node(state, parent, action, prior) {
+    this.state = state; this.parent = parent; this.action = action; this.prior = prior;
+    this.N = 0; this.W = 0;
+    this.children = [];
+    this.expanded = false; this.exact = null; this.allowed = null; this.netValue = null; this.kind = null;
+  }
+  const q = c => (c.N ? c.W / c.N : 0);
+
+  function expand(N, node, bridge) {
+    const t = tactics(N, node.state);
+    node.expanded = true; node.allowed = t.allowed; node.exact = t.exact; node.kind = t.kind;
+    if (t.kind === 'terminal') return t.exact;
+    const { byAction, value } = evaluateRaw(node.state, t.allowed, bridge);
+    const total = pySum(t.allowed.map(a => (byAction.has(a) ? byAction.get(a) : 0)));
+    for (const a of t.allowed) {
+      const p = total > 0 ? (byAction.has(a) ? byAction.get(a) : 0) / total : 1 / t.allowed.length;
+      node.children.push(new Node(null, node, a, p));
+    }
+    node.netValue = value;
+    return t.exact !== null ? t.exact : value;
+  }
+
+  function select(node) {
+    const sq = Math.sqrt(Math.max(1, node.N));
+    let best = null, bestScore = -Infinity;
+    for (const c of node.children) {
+      const score = q(c) + C_PUCT * c.prior * sq / (1 + c.N);
+      if (score > bestScore) { best = c; bestScore = score; }
+    }
+    return best;
+  }
+
+  function proof(root) {
+    if (root.exact === 1) return { proven: true, outcome: 'win', best: root.allowed[0] };
+    for (const c of root.children) {
+      if (c.expanded && c.exact === -1 && c.state.toMove !== root.state.toMove) return { proven: true, outcome: 'win', best: c.action };
+    }
+    if (root.exact === -1) return { proven: true, outcome: 'loss', best: null };
+    const kids = root.children;
+    if (kids.length && kids.every(c => c.expanded && c.exact === 1 && c.state.toMove !== root.state.toMove)) return { proven: true, outcome: 'loss', best: null };
+    return { proven: false, outcome: null, best: null };
+  }
+
+  // Deterministic run_search(dirichlet=0). Stops at `simulations` or the deadline, whichever is first.
+  function search(N, state, simulations, deadline, bridge) {
+    const t0 = now();
+    const root = new Node(state, null, null, 0);
+    const rootValue = expand(N, root, bridge);
+    const kind = root.kind;
+    root.N = 1; root.W = rootValue;
+    if (kind === 'terminal') {
+      return { root, visits: {}, best: null, value: rootValue, netValue: null, priors: {}, simulations: 0, requestedSimulations: simulations,
+        proven: true, provenOutcome: rootValue > 0 ? 'win' : 'loss', tactic: 'terminal', deadlineHit: false, elapsedMs: now() - t0 };
+    }
+    let done = 0, deadlineHit = false;
+    while (done < simulations) {
+      if (deadline !== null && now() >= deadline) { deadlineHit = true; break; }
+      let node = root;
+      const path = [root];
+      while (node.children.length && (node === root || node.exact === null)) {
+        const child = select(node);
+        if (child.state === null) child.state = N.applyAction(node.state, child.action);
+        node = child;
+        path.push(node);
+        if (!node.expanded) break;
+      }
+      const value = !node.expanded ? expand(N, node, bridge) : node.exact !== null ? node.exact : node.netValue;
+      const leaf = node.state.toMove;
+      for (let k = path.length - 1; k >= 0; k--) {
+        const nd = path[k];
+        nd.N += 1;
+        if (nd.parent) nd.W += nd.parent.state.toMove === leaf ? value : -value;
+      }
+      done++;
+    }
+    const visits = {}, priors = {};
+    let total = 0;
+    for (const c of root.children) { visits[c.action] = c.N; priors[c.action] = c.prior; total += c.N; }
+    const wsum = pySum(root.children.map(c => c.W));
+    const pr = proof(root);
+    let best = pr.best;
+    if (best === null) {
+      let top = null;
+      for (const c of root.children) if (!top || c.N > top.N || (c.N === top.N && c.prior > top.prior)) top = c;
+      best = top.action;
+    }
+    let value = total === 0 ? rootValue : wsum / total;
+    if (pr.proven) value = pr.outcome === 'win' ? 1 : -1;
+    return { root, visits, best, value, netValue: root.netValue, priors, simulations: done, requestedSimulations: simulations,
+      proven: pr.proven, provenOutcome: pr.outcome, tactic: kind, deadlineHit, elapsedMs: now() - t0 };
+  }
+
+  function budget(opts) {
+    const o = opts || {};
+    let sims = MAX_SIMS, ms = null;
+    if (o.simulations !== undefined) {
+      if (!Number.isInteger(o.simulations) || o.simulations < 0) throw new Error('simulations must be a non-negative integer');
+      sims = Math.min(MAX_SIMS, o.simulations);
+    }
+    if (o.ms !== undefined) {
+      if (typeof o.ms !== 'number' || !Number.isFinite(o.ms)) throw new Error('ms must be a finite number');
+      ms = clamp(o.ms, 0, MAX_MS);
+    } else if (o.simulations === undefined) ms = DEFAULT_MS;
+    return { sims, ms };
+  }
+
+  // ---- public raw API (Python state shape: n, grid, toMove, ply, swapEnabled, swapAvailable) ----
+
+  // value: 'adjacent' (installed trainer heuristic) or 'bridge' (bridge-aware value, BV).
+  function useBridge(value, dflt) {
+    if (value === undefined) return dflt;
+    if (value !== 'bridge' && value !== 'adjacent') throw new Error("value must be 'bridge' or 'adjacent'");
+    return value === 'bridge';
+  }
+
+  function evaluate(state, actions, opts) {
+    const bridge = useBridge(opts && opts.value, false);
+    const N = runtime(), s = N.validateState(state);
+    if (s.winner) throw new Error('game is over');
+    const legal = N.legalActions(s);
+    let acts = legal;
+    if (actions !== undefined) {
+      if (!Array.isArray(actions) || !actions.length) throw new Error('actions must be a non-empty array');
+      for (const a of actions) if (!legal.includes(a)) throw new Error('illegal action ' + a);
+      acts = actions.slice();
+    }
+    const { byAction, value } = evaluateRaw(s, acts, bridge);
+    const priors = {};
+    for (const [a, p] of byAction) priors[a] = p;
+    return { priors, value, actions: acts, estimated: true, id: ID, evaluator: bridge ? 'bridge-value' : 'adjacent' };
+  }
+
+  function strip(r) {
+    const { root, ...out } = r;
+    out.engine = ID; out.estimated = !r.proven; out.elapsedMs = Math.round(r.elapsedMs);
+    return out;
+  }
+
+  function analyze(state, opts) {
+    const N = runtime(), s = N.validateState(state);
+    const b = budget(opts), bridge = useBridge(opts && opts.value, false);
+    const t0 = now();
+    const out = strip(search(N, s, b.sims, b.ms === null ? null : t0 + b.ms, bridge));
+    out.evaluator = bridge ? 'bridge-value' : 'adjacent';
+    return out;
+  }
+
+  // ---- live wrapper: display snapshot in, HexLive-shaped result out ----
+
+  function liveState(v) {
+    const lead = v.toMove === RED ? v.blue - v.red : v.red - v.blue;
+    const swapped = v.toMove === RED ? lead === 1 : lead === 0;
+    if (v.toMove === BLUE && v.red + v.blue === 0) return null;
+    return { n: v.n, grid: Array.from(v.g), toMove: v.toMove, ply: v.red + v.blue + (swapped ? 1 : 0), swapEnabled: v.swap || swapped || (v.n === 11 && v.red + v.blue === 0), swapAvailable: v.swap };
+  }
+
+  function emptyBase(v) {
+    return {
+      version: 1, n: v.n, viewer: v.viewer, toMove: v.toMove, opponentTurn: v.toMove !== v.viewer, terminal: false, winner: 0,
+      best: null, alternatives: [], avoid: [], avoidDetail: [], mustBlock: null, forcedWin: null, forcedLoss: null, swap: null, swapAdvice: null,
+      sims: 0, candidateCount: 0, legalCount: 0, estimated: true,
+      tactics: { viewerThreats: [], opponentThreats: [], opponentWinningReplies: [], scanned: 0, scanComplete: false, proofCalls: 0, proofBudgetHits: 0 },
+      elapsedMs: 0
+    };
+  }
+
+  const proofOut = (n, side, kind, move, cells) => ({
+    side, kind, proven: true, move: move == null ? null : keyOf(n, move), cells: cells.map(i => keyOf(n, i)), carrier: [], pairs: [], bridges: 0, path: []
+  });
+
+  function analyzeLive(snapshot, opts = {}) {
+    const t0 = now();
+    const L = globalThis.HexLive;
+    if (!L || typeof L.validate !== 'function') throw new Error('HexHeuristic.analyzeLive needs hex-live-core.js (HexLive) loaded first');
+    const v = L.validate(snapshot);
+    const ms = clamp(typeof opts.ms === 'number' && Number.isFinite(opts.ms) ? opts.ms : DEFAULT_MS, 0, MAX_MS);
+    const bridge = useBridge(opts.value, LIVE_BRIDGE);
+    const given = opts.tacticalBase && typeof opts.tacticalBase === 'object' ? opts.tacticalBase : null;
+    if (given && (given.n !== v.n || given.viewer !== v.viewer || given.toMove !== v.toMove)) throw new Error('tacticalBase does not match the snapshot');
+    const info = (used, reason, extra) => ({ id: ID, evaluator: bridge ? 'bridge-value' : 'adjacent', used, reason, simulations: 0, ...extra });
+    const finish = (res, used, reason, extra) => {
+      res.engine = ID; res.modelId = null;
+      if (res.simulations === undefined) res.simulations = 0;
+      res.heuristic = info(used, reason, { simulations: res.simulations, ...extra });
+      res.elapsedMs = Math.round(now() - t0);
+      return res;
+    };
+    const noMove = (res, reason, keepProven) => {
+      const proven = keepProven && res.best && res.best.proven ? res.best : null;
+      res.best = proven;
+      res.alternatives = proven ? (res.alternatives || []).filter(m => m && m.proven) : [];
+      res.swap = res.swapAdvice = null;
+      return finish(res, false, reason);
+    };
+
+    if (v.n > MAX_N) return noMove(given ? { ...given } : emptyBase(v), 'size-unsupported', !!given);
+    let base = given;
+    if (!base) {
+      const tms = clamp(ms * TACTICAL_SHARE, TACTICAL_MIN_MS, TACTICAL_MAX_MS);
+      const lo = { ms: tms, tacticalOnly: true };
+      if (Number.isInteger(opts.seed)) lo.seed = opts.seed;
+      base = L.analyze(snapshot, lo);
+    }
+    const res = { ...base, avoid: (base.avoid || []).slice(), avoidDetail: (base.avoidDetail || []).slice() };
+    if (res.terminal) return noMove(res, 'terminal', false);
+    if (v.toMove !== v.viewer) return noMove(res, 'opponent-turn', false);
+    if (res.best && res.best.proven) return noMove(res, 'tactical-result', true);
+
+    const N = runtime();
+    const raw = liveState(v);
+    let state = null;
+    if (raw) try { state = N.validateState(raw); } catch (e) { state = null; }
+    if (!state || state.winner) return noMove(res, 'state-unsupported', false);
+
+    const left = given ? ms : ms - (now() - t0);
+    const sims = Number.isInteger(opts.simulations) && opts.simulations >= 0 ? Math.min(MAX_SIMS, opts.simulations) : MAX_SIMS;
+    const r = search(N, state, sims, now() + Math.max(0, left), bridge);
+    const { n } = v, root = r.root;
+    const avoid = new Set(res.avoid);
+    const complete = !!(res.tactics && res.tactics.scanComplete);
+    // Only a published loss proof makes moves losing; "every searched child loses" is reported, not proven.
+    const rootDoubleThreat = root.kind === 'double-threat';
+    const lost = !!res.forcedLoss || rootDoubleThreat;
+    const ranked = root.children.slice().sort((a, b) => (b.N - a.N) || (b.prior - a.prior));
+    if (r.proven && r.provenOutcome === 'win') {
+      const k = ranked.findIndex(c => c.action === r.best);
+      if (k > 0) ranked.unshift(ranked.splice(k, 1)[0]);
+    }
+    const provenChild = c => (root.exact === 1 && c.action === r.best) || (c.expanded && c.exact === -1);
+    const toMove = c => {
+      const value = c.N ? c.W / c.N : null;
+      const common = { win: value === null ? null : clamp((value + 1) / 2, EST_FLOOR, EST_CEIL), proven: false, kind: 'heuristic', engine: ID,
+        visits: c.N, prior: c.prior, value, estimated: true, legal: true };
+      if (c.action === SWAP) return { action: 'SWAP', cell: 'SWAP', ...common, kind: 'swap', checked: false };
+      const out = { action: 'PLAY', cell: keyOf(n, c.action), index: c.action, ...common, checked: complete || avoid.has(keyOf(n, c.action)) };
+      if (!lost && provenChild(c)) {
+        const imm = root.exact === 1 || c.kind === 'terminal';
+        if (!imm && c.kind !== 'double-threat') return out;
+        Object.assign(out, { win: 1, proven: true, kind: imm ? 'immediate' : 'double-threat', estimated: false, checked: true });
+      }
+      if (lost) Object.assign(out, { win: 0, losing: true, proven: false, estimated: false });
+      return out;
+    };
+    let moves = ranked.map(toMove);
+    const safe = moves.filter(m => !avoid.has(m.cell));
+    if (safe.length) moves = safe;
+    else if (!lost) return noMove(res, 'heuristic-refuted', false);
+    if (lost) for (const m of moves) Object.assign(m, { win: 0, losing: true, proven: false, estimated: false });
+
+    if (!res.forcedLoss && rootDoubleThreat) {
+      res.forcedLoss = proofOut(n, other(v.viewer), 'double-threat', null, N.winningCells(state.grid, n, other(v.viewer)));
+      res.forcedWin = null;
+    }
+    if (!lost && moves[0].proven && !res.forcedWin) {
+      const b = moves[0], g2 = N.applyAction(state, b.index);
+      res.forcedWin = proofOut(n, v.viewer, b.kind, b.index, b.kind === 'immediate' ? [b.index] : N.winningCells(g2.grid, n, v.viewer));
+    }
+
+    res.best = moves[0];
+    res.alternatives = moves.slice(1, 1 + MAX_ALTERNATIVES);
+    res.candidateCount = root.children.length;
+    res.simulations = r.simulations;
+    res.estimated = true;
+    res.swap = res.swapAdvice = null;
+    if (v.swap) {
+      const sw = moves.find(m => m.action === 'SWAP'), keep = moves.find(m => m.action === 'PLAY');
+      if (sw && keep) {
+        const margin = sw.win === null || keep.win === null ? null : sw.win - keep.win;
+        res.swap = res.swapAdvice = { recommend: res.best.action, winIfSwap: sw.win, winIfKeep: keep.win, margin, close: margin === null ? null : Math.abs(margin) < 0.1,
+          opening: keyOf(n, v.opening), bestReply: keep.cell, estimated: true, source: 'heuristic' };
+      }
+    }
+    const priors = root.children.map(c => ({ cell: c.action === SWAP ? 'SWAP' : keyOf(n, c.action), probability: c.prior }))
+      .sort((a, b) => b.probability - a.probability).slice(0, MAX_PRIORS);
+    return finish(res, true, 'search', { value: r.value, netValue: r.netValue, tactic: r.tactic, proven: r.proven, provenOutcome: r.provenOutcome,
+      deadlineHit: r.deadlineHit, priors });
+  }
+
+  const api = Object.freeze({ ID, LIVE_VALUE: LIVE_BRIDGE ? 'bridge' : 'adjacent', SWAP, MIN_N, MAX_N, C_PUCT, MAX_SIMS, TACTICAL_MAX_MS, evaluate, analyze, analyzeLive, liveState: v => liveState(v) });
+  if (typeof module === 'object' && module && module.exports) module.exports = api;
+  return api;
+})();
+
+</script>
+<script>
+let N=11;const SWAP=121,$=id=>document.getElementById(id),svg=$("board"),NS="http://www.w3.org/2000/svg";
+let hist=[],moves=[],busy=false,cfg={},switches=[];
+const cur=()=>hist[hist.length-1];
+const ENG=document.getElementById("engine-src").textContent;(0,eval)(ENG);
+const HN=globalThis.HexNeural,plain=s=>({n:s.n,grid:Array.from(s.grid),toMove:s.toMove,ply:s.ply,swapEnabled:s.swapEnabled,swapAvailable:s.swapAvailable});
+function chain(g,n,w){if(!w)return[];const seen=new Set(),q=[];for(let k=0;k<n;k++){const i=w===1?k:k*n;if(g[i]===w){seen.add(i);q.push(i)}}
+  const D=[[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0]];while(q.length){const u=q.pop(),r=(u/n)|0,c=u%n;for(const[dr,dc]of D){const rr=r+dr,cc=c+dc,v=rr*n+cc;if(rr>=0&&rr<n&&cc>=0&&cc<n&&g[v]===w&&!seen.has(v)){seen.add(v);q.push(v)}}}return[...seen]}
+const view=s=>{const w=s.winner||0;return{state:plain(s),winner:w,winningCells:chain(s.grid,s.n,w),legal:w?[]:Array.from(HN.legalActions(s))}};
+const worker=new Worker(URL.createObjectURL(new Blob([ENG,'\nonmessage=e=>{const{id,state,engine,sims}=e.data;try{const t=Date.now(),r=HexHeuristic.analyze(state,{simulations:sims,value:engine==="bv"?"bridge":"adjacent"});postMessage({id,action:r.best,proven:r.proven,ms:Date.now()-t})}catch(x){postMessage({id,error:String(x&&x.message||x)})}};'],{type:"text/javascript"})));
+let reqId=0;const waiting=new Map();worker.onmessage=e=>{const w=waiting.get(e.data.id);waiting.delete(e.data.id);if(w)e.data.error?w[1](new Error(e.data.error)):w[0](e.data)};
+const api=async(p,b)=>{
+  if(p==="/api/new")return view(HN.validateState({n:b.n||11,grid:new Array((b.n||11)**2).fill(0),toMove:1,ply:0,swapEnabled:!!b.swap,swapAvailable:false}));
+  if(p==="/api/apply")return view(HN.applyAction(HN.validateState(b.state),b.action));
+  if(p==="/api/engine"){const r=await new Promise((ok,no)=>{const id=++reqId;waiting.set(id,[ok,no]);worker.postMessage({id,state:b.state,engine:b.engine,sims:b.sims})});
+    return{...view(HN.applyAction(HN.validateState(b.state),r.action)),action:r.action,ms:r.ms,proven:r.proven}}
+  if(p==="/api/save"){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify({at:new Date().toISOString(),...b},null,1)],{type:"application/json"}));a.download="hex-game-"+Date.now()+".json";a.click();return{saved:true}}
+  throw new Error("unknown "+p)};
+const R=22,W=Math.sqrt(3)*R,H=1.5*R,PAD=34;
+const ctr=(r,c)=>[PAD+W/2+c*W+r*W/2,PAD+R+r*H];
+const name=a=>a===SWAP?"swap":String.fromCharCode(65+a%N)+(Math.floor(a/N)+1);
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e}
+function draw(){
+  const v=cur(),s=v.state,two=cfg.engine==='human',mine=(two||s.toMove===cfg.human)&&!v.winner&&!busy;
+  svg.setAttribute("viewBox",`0 0 ${PAD*2+W*N+W*(N-1)/2} ${PAD*2+H*(N-1)+2*R}`);svg.textContent="";
+  const [a0]=ctr(0,0),[a1]=ctr(0,N-1),[b0,by]=ctr(N-1,0),[b1]=ctr(N-1,N-1);
+  svg.append(el("line",{x1:a0,y1:PAD-8,x2:a1,y2:PAD-8,stroke:"var(--red)","stroke-width":5,"stroke-linecap":"round"}),
+    el("line",{x1:b0,y1:by+R+8,x2:b1,y2:by+R+8,stroke:"var(--red)","stroke-width":5,"stroke-linecap":"round"}),
+    el("line",{x1:a0-W/2-8,y1:PAD+R,x2:b0-W/2-8,y2:by,stroke:"var(--blue)","stroke-width":5,"stroke-linecap":"round"}),
+    el("line",{x1:a1+W/2+8,y1:PAD+R,x2:b1+W/2+8,y2:by,stroke:"var(--blue)","stroke-width":5,"stroke-linecap":"round"}));
+  const last=moves.length?moves[moves.length-1]:null,win=new Set(v.winningCells);
+  for(let r=0;r<N;r++)for(let c=0;c<N;c++){
+    const i=r*N+c,[x,y]=ctr(r,c),pts=[];for(let k=0;k<6;k++){const t=Math.PI/180*(60*k-30);pts.push((x+R*Math.cos(t)).toFixed(1)+","+(y+R*Math.sin(t)).toFixed(1))}
+    const g=s.grid[i],ok=mine&&g===0;
+    const h=el("polygon",{points:pts.join(" "),class:"hex"+(g===1?" r":g===2?" b":"")+(ok?" ok":"")+(win.has(i)?" win":"")});
+    h.append(Object.assign(document.createElementNS(NS,"title"),{textContent:name(i)}));
+    if(ok)h.addEventListener("click",()=>human(i));svg.append(h);
+    if(g&&((last!==null&&last!==SWAP&&last===i)||(last===SWAP&&moves.length===2)))svg.append(el("circle",{cx:x,cy:y,r:6,class:"last"}));
+  }
+  for(let c=0;c<N;c++){const [x]=ctr(0,c);const t=el("text",{x,y:PAD-16,class:"lab"});t.textContent=String.fromCharCode(65+c);svg.append(t)}
+  for(let r=0;r<N;r++){const [x,y]=ctr(r,0);const t=el("text",{x:x-W/2-20,y:y+4,class:"lab"});t.textContent=r+1;svg.append(t)}
+  const st=$("status"),who=c=>c===1?"Red":"Blue";
+  st.className=v.winner?(v.winner===1?"red":"blue"):"";
+  st.textContent=two?(v.winner?who(v.winner)+" wins":who(s.toMove)+" to move"):v.winner?(v.winner===cfg.human?"You win":"The engine wins")+` (${who(v.winner)})`:busy?"Engine is thinking":`Your move (${who(cfg.human)})`;
+  if(two&&!v.winner)st.className=s.toMove===1?"red":"blue";
+  $("moves").textContent=moves.map((m,i)=>`${i+1}.${name(m)}`).join("  ");
+  $("swapbtn").hidden=!(mine&&v.legal.includes(SWAP));$("undo").disabled=busy||hist.length<2;$("switch").disabled=busy||!!v.winner||two;$("side").disabled=$("sims").disabled=$("eng").value==="human";
+}
+async function engine(){
+  const v=cur();if(v.winner||cfg.engine==='human'||v.state.toMove===cfg.human)return draw();
+  busy=true;draw();
+  try{const o=await api("/api/engine",{state:v.state,engine:cfg.engine,sims:cfg.sims});moves.push(o.action);hist.push(o)}
+  catch(e){$("status").textContent="Engine error: "+e.message;busy=false;return}
+  busy=false;draw();
+}
+async function human(a){if(busy)return;const o=await api("/api/apply",{state:cur().state,action:a});moves.push(a);hist.push(o);await engine()}
+async function start(){
+  N=+$("size").value;cfg={n:N,human:+$("side").value,engine:$("eng").value,sims:+$("sims").value,swap:$("swap").value==="1"};
+  hist=[await api("/api/new",{swap:cfg.swap,n:N})];moves=[];switches=[];$("saved").textContent="";busy=false;await engine();
+}
+$("new").onclick=start;
+$("switch").onclick=()=>{if(busy||cur().winner)return;cfg.human=3-cfg.human;$("side").value=cfg.human;switches.push(moves.length);engine()};$("swapbtn").onclick=()=>human(SWAP);
+$("eng").onchange=()=>draw();
+$("undo").onclick=()=>{if(busy)return;if(cfg.engine==='human'){if(hist.length>1){hist.pop();moves.pop()}return draw()}do{hist.pop();moves.pop()}while(hist.length>1&&cur().state.toMove!==cfg.human);if(cur().state.toMove!==cfg.human)engine();else draw()};
+$("save").onclick=async()=>{await api("/api/save",{n:cfg.n,human:cfg.human,engine:cfg.engine,sims:cfg.sims,swap:cfg.swap,moves,switches,winner:cur().winner,note:$("note").value});$("saved").textContent="Downloaded "+new Date().toLocaleTimeString()};
+start();
+</script></body></html>
