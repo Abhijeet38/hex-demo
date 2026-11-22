@@ -49,10 +49,14 @@ svg{max-height:84vh}
 .hex.pend,.hex.mark{fill:#5a4a12;stroke:#f3d98b}.hex.peer{fill:#123f5a;stroke:#6cc7ff}.hex.mark.both{fill:#3f3f72;stroke:#fff}
 @media(hover:none){.hex.ok:hover{fill:var(--cell)}.hex.pend:hover,.hex.mark:hover{fill:#5a4a12}.hex.peer:hover{fill:#123f5a}.hex.mark.both:hover{fill:#3f3f72}}
 @media(max-width:900px){svg{max-height:none}}
+.hex.sug{fill:#3a2a55;stroke:#c9a2ff;stroke-width:3}.sugdot{fill:#c9a2ff;pointer-events:none}
+@media(hover:none){.hex.sug:hover{fill:#3a2a55}}
+@media(max-width:900px){#sugrow{padding:0 8px}}
 </style></head><body><main>
 <section><h1>Hex: play the bridge engine or a friend</h1>
 <p class="sub">Green connects top to bottom and always moves first. Pink connects side to side.</p>
 <div class="card"><div id="status">Loading</div><svg id="board" role="img" aria-label="Hex board"></svg><div class="row" id="acts"><button id="swapbtn" class="primary" hidden>Swap: take that stone and play as Green</button></div>
+<div class="row" id="sugrow" hidden><button id="sugbtn">Show the engine's move</button></div>
 <div id="tools" hidden><div class="row"><button id="rvback">◀ Back</button><button id="rvfwd">Forward ▶</button><button id="rvlive">Live</button></div>
 <div class="row"><button id="markbtn" aria-pressed="false">Mark cells: off</button><button id="markclr">Clear my marks</button></div></div>
 <div class="key"><span><span class="dot" style="background:var(--red)"></span>Green: top to bottom</span><span><span class="dot" style="background:var(--blue)"></span>Pink: side to side</span></div></div>
@@ -938,7 +942,7 @@ globalThis.HexHeuristic = (() => {
 </script>
 <script>
 let N=11;const SWAP=121,$=id=>document.getElementById(id),svg=$("board"),NS="http://www.w3.org/2000/svg";
-let hist=[],moves=[],busy=false,cfg={},switches=[],pend=null;
+let hist=[],moves=[],busy=false,cfg={},switches=[],pend=null,sug=null,sugBusy=false;
 // ---- online 1v1: two browsers that open the same link with the same room code ----
 const net={peer:null,conn:null,room:null,host:false,color:0,resigned:0};
 net.marks=new Set();net.hints=[];net.hintP=null;net.rev=null;net.mark=false;
@@ -1024,6 +1028,7 @@ function draw(){
   // After a swap the two players trade colours and the stone stays put, so the board is shown mirrored with colours exchanged.
   const ml=rev===null?moves.length:rev,sw=ml>=2&&moves[1]===SWAP,E=d=>sw?TR(d):d,dc=c=>c?(sw?3-c:c):0;
   const canPoint=on&&live&&!!net.color&&!mine;
+  if(sug&&(sug.h!==hist||sug.len!==moves.length||!two))sug=null;const sugD=sug&&sug.a!==SWAP?E(sug.a):null;
   if(net.seen!==moves.length){net.seen=moves.length;pend=null;net.hintP=null}
   if(rev===null)for(const m of [...net.marks])if(s.grid[E(m)]!==0)net.marks.delete(m);
   if(pend!==null&&(s.grid[E(pend)]!==0||!(mine&&$("tap2").checked)))pend=null;
@@ -1034,11 +1039,12 @@ function draw(){
   for(let r=0;r<N;r++)for(let c=0;c<N;c++){
     const d=r*N+c,i=E(d),[x,y]=ctr(r,c),P=hexPts(x,y,R);
     const g=dc(s.grid[i]),ok=mine&&g===0,swapHere=canSwap&&g!==0;
-    const h=el("polygon",{points:P.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" "),class:"hex"+(g===1?" r":g===2?" b":"")+(ok||swapHere?" ok":"")+(canPoint&&g===0?" pt":"")+(g!==0?"":pend===d?" pend":myM.has(d)?(hints.has(d)?" mark both":" mark"):(hints.has(d)||hintP===d)?" peer":"")+(win.has(i)?" win":"")});
+    const h=el("polygon",{points:P.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" "),class:"hex"+(g===1?" r":g===2?" b":"")+(ok||swapHere?" ok":"")+(canPoint&&g===0?" pt":"")+(sugD===d&&g===0?" sug":"")+(g!==0?"":pend===d?" pend":myM.has(d)?(hints.has(d)?" mark both":" mark"):(hints.has(d)||hintP===d)?" peer":"")+(win.has(i)?" win":"")});
     h.append(Object.assign(document.createElementNS(NS,"title"),{textContent:swapHere?"Swap: take this stone":name(d)}));
     if(ok)h.addEventListener("click",()=>{if(!$("tap2").checked||pend===d){pend=null;human(i)}else{pend=d;draw()}});
     else if(swapHere)h.addEventListener("click",()=>human(SWAP));
     else if(canPoint&&g===0)h.addEventListener("click",()=>{if(net.marks.has(d))net.marks.delete(d);else if(net.marks.size<60)net.marks.add(d);draw()});svg.append(h);
+    if(sugD===d&&g===0)top.push(el("circle",{cx:x,cy:y,r:5,class:"sugdot"}));
     if(g){top.push(el("polygon",{points:hexPts(x,y,R*.8).map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" "),class:"stone "+(g===1?"r":"b")+(win.has(i)?" win":"")}));
       if(swapHere){const t=el("text",{x,y:y+8,class:"swapico"});t.textContent="\u21c4";top.push(t)}
       else if((last!==null&&last!==SWAP&&last===i)||(last===SWAP&&ml===2))top.push(el("circle",{cx:x,cy:y,r:5,class:"last",fill:"none"}))}
@@ -1062,8 +1068,10 @@ function draw(){
   else if(hints.size>1)st.textContent+=". Your friend marked "+hints.size+" cells"
   if(on&&live&&net.mark&&rev===null&&pend===null)st.textContent+=". Mark mode: taps mark cells"
   if(canSwap&&pend===null)st.textContent+=". Or tap the stone to swap"
+  if(two&&sugBusy)st.textContent+=". Engine is thinking"
+  else if(sug)st.textContent+=". Engine suggests "+(sug.a===SWAP?"swapping":name(sugD))
   $("moves").textContent=moves.map((m,k)=>`${k+1}.${m===SWAP?"swap":name(k>=1&&moves[1]===SWAP?TR(m):m)}`).join("  ");
-  $("swapbtn").hidden=!(mine&&v.legal.includes(SWAP));$("undo").disabled=busy||hist.length<2;$("switch").disabled=busy||!!v.winner||two;$("side").disabled=$("sims").disabled=$("eng").value==="human"||$("eng").value==="online";if(on){$("switch").disabled=!live||!net.color;$("undo").disabled=!live||!moves.length||!!net.resigned||rev!==null}$("tools").hidden=!on;$("rvback").disabled=!on||!live||ml===0;$("rvfwd").disabled=$("rvlive").disabled=!on||!live||rev===null;$("markbtn").disabled=!on||!live;$("markbtn").textContent="Mark cells: "+(net.mark?"on":"off");$("markbtn").className=net.mark?"primary":"";$("markbtn").setAttribute("aria-pressed",String(net.mark));$("markclr").disabled=!net.marks.size;$("resign").disabled=!on||!live||!!v.winner||!!net.resigned;$("net").hidden=$("eng").value!=="online";$("chat").hidden=!on;if(rev!==null)$("resign").disabled=true;$("chatsend").disabled=$("chatin").disabled=!on||!live;
+  $("swapbtn").hidden=!(mine&&v.legal.includes(SWAP));$("undo").disabled=busy||hist.length<2;$("switch").disabled=busy||!!v.winner||two;$("side").disabled=$("eng").value==="human"||$("eng").value==="online";$("sims").disabled=$("eng").value==="online";$("sugrow").hidden=!two;$("sugbtn").disabled=!two||sugBusy||!!v.winner;if(on){$("switch").disabled=!live||!net.color;$("undo").disabled=!live||!moves.length||!!net.resigned||rev!==null}$("tools").hidden=!on;$("rvback").disabled=!on||!live||ml===0;$("rvfwd").disabled=$("rvlive").disabled=!on||!live||rev===null;$("markbtn").disabled=!on||!live;$("markbtn").textContent="Mark cells: "+(net.mark?"on":"off");$("markbtn").className=net.mark?"primary":"";$("markbtn").setAttribute("aria-pressed",String(net.mark));$("markclr").disabled=!net.marks.size;$("resign").disabled=!on||!live||!!v.winner||!!net.resigned;$("net").hidden=$("eng").value!=="online";$("chat").hidden=!on;if(rev!==null)$("resign").disabled=true;$("chatsend").disabled=$("chatin").disabled=!on||!live;
   if(on&&live){if(net.sentTo!==net.conn){net.sentTo=net.conn;net.sent=null}const key=[...net.marks].sort((a,b)=>a-b).join(",")+"|"+pend;if(net.sent!==key){net.sent=key;net.conn.send({t:"hint",a:[...net.marks],p:pend,len:moves.length})}}
 }
 async function engine(){
@@ -1101,6 +1109,11 @@ function setView(k){if(!online()||!net.conn||!net.conn.open)return;net.rev=k!==n
 $("rvback").onclick=()=>setView((net.rev===null?moves.length:Math.min(net.rev,moves.length))-1);
 $("rvfwd").onclick=()=>{if(net.rev!==null)setView(net.rev+1)};$("rvlive").onclick=()=>setView(null);
 $("markbtn").onclick=()=>{net.mark=!net.mark;pend=null;draw()};$("markclr").onclick=()=>{net.marks.clear();draw()};
+$("sugbtn").onclick=async()=>{if(cfg.engine!=="human"||sugBusy||cur().winner)return;const h0=hist,n0=moves.length,st0=cur().state;sugBusy=true;draw();
+  try{const r=await new Promise((ok,no)=>{const id=++reqId;waiting.set(id,[ok,no]);worker.postMessage({id,state:st0,engine:"bv",sims:+$("sims").value})});
+    if(hist===h0&&moves.length===n0&&cfg.engine==="human")sug={h:h0,len:n0,a:r.action}}
+  catch(e){$("saved").textContent="Engine error: "+e.message}
+  sugBusy=false;draw()};
 $("connect").onclick=netConnect;
 $("room").addEventListener("keydown",e=>{if(e.key==="Enter")netConnect()});
 $("resign").onclick=()=>{if(!online()||!net.conn||!net.conn.open||cur().winner||net.resigned)return;net.resigned=net.color;net.conn.send({t:"resign"});draw()};
