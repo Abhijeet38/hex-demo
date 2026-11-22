@@ -32,11 +32,22 @@ h1{font-size:17px}.sub{font-size:12px;margin-bottom:8px}
 select,button,input,textarea{font-size:16px;min-height:46px}
 svg{max-height:88vh;max-height:88dvh}.lab{font-size:14px}
 }
+.hex.peer{fill:#cfe8d4;stroke:#1a7f37;stroke-width:2.5}.hex.pt{cursor:pointer}
+@media(hover:none){.hex.peer:hover{fill:#cfe8d4}}
+#chatlog{max-height:150px;overflow:auto;font-size:14px;line-height:1.5;word-break:break-word}#chatlog div.me{color:var(--mute)}#chatlog:empty::before{content:"No messages yet";color:var(--mute);font-size:13px}
+#chatrow button{width:auto;flex:none;padding-left:16px;padding-right:16px}#chatrow input{flex:1;min-width:0}
+.hex.mark{fill:#f3d98b;stroke:#111;stroke-width:2.5}.hex.mark.both{fill:#b9dd8f}
+@media(hover:none){.hex.mark:hover{fill:#f3d98b}.hex.mark.both:hover{fill:#b9dd8f}}
+@media(max-width:900px){#tools{padding:0 8px}}
 </style></head><body><main>
 <section><h1>Hex: play the bridge engine or a friend</h1>
 <p class="sub">Red connects top to bottom and moves first. Blue connects left to right.</p>
 <div class="card"><div id="status">Loading</div><svg id="board" role="img" aria-label="Hex board"></svg><div class="row" id="acts"><button id="swapbtn" class="primary" hidden>Swap: take the first move as yours</button></div>
-<div class="key"><span><span class="dot" style="background:var(--red)"></span>Red: top to bottom</span><span><span class="dot" style="background:var(--blue)"></span>Blue: left to right</span></div></div></section>
+<div id="tools" hidden><div class="row"><button id="rvback">◀ Back</button><button id="rvfwd">Forward ▶</button><button id="rvlive">Live</button></div>
+<div class="row"><button id="markbtn" aria-pressed="false">Mark cells: off</button><button id="markclr">Clear my marks</button></div></div>
+<div class="key"><span><span class="dot" style="background:var(--red)"></span>Red: top to bottom</span><span><span class="dot" style="background:var(--blue)"></span>Blue: left to right</span></div></div>
+<div class="card" id="chat" hidden><label for="chatin">Chat with your friend</label><div id="chatlog" role="log" aria-live="polite"></div>
+<div class="row" id="chatrow"><input id="chatin" maxlength="300" autocomplete="off" enterkeyhint="send"><button id="chatsend">Send</button></div></div></section>
 <aside>
 <div class="card"><label for="size">Board</label><select id="size"><option value="11">11 × 11</option><option value="9">9 × 9</option></select>
 <label for="side">You play</label><select id="side"><option value="1">Red (first)</option><option value="2">Blue (second)</option></select>
@@ -920,7 +931,9 @@ let N=11;const SWAP=121,$=id=>document.getElementById(id),svg=$("board"),NS="htt
 let hist=[],moves=[],busy=false,cfg={},switches=[],pend=null;
 // ---- online 1v1: two browsers that open the same link with the same room code ----
 const net={peer:null,conn:null,room:null,host:false,color:0,resigned:0};
+net.marks=new Set();net.hints=[];net.hintP=null;net.rev=null;net.mark=false;
 const online=()=>cfg.engine==="online";
+function setColor(c){net.color=c;store.set("hexcol:"+net.room,String(c));cfg.human=c;$("side").value=String(c);pend=null;setNet("Connected. You are "+(c===1?"Red (top to bottom, moves first)":"Blue (left to right)"))}
 const setNet=s=>{$("net-status").textContent=s};
 const store={get:k=>{try{return sessionStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{sessionStorage.setItem(k,v)}catch(e){}}};
 function pid(code){let a=0x811c9dc5,b=0x9e3779b9;const s="hexbv1:"+code.trim().toLowerCase();
@@ -947,14 +960,14 @@ function tryGuest(attempt){
     else setNet("Connection problem ("+e.type+"). Press Connect to retry")})}
 function wire(c){
   c.on("open",()=>{net.conn=c;c.send({t:"sync",n:cfg.n,swap:cfg.swap,moves:moves.slice(),color:net.color,resigned:net.resigned})});
-  c.on("data",m=>{onNet(m).catch(e=>setNet("Sync problem: "+e.message))});
+  c.on("data",m=>{net.q=(net.q||Promise.resolve()).then(()=>onNet(m)).catch(e=>setNet("Sync problem: "+e.message))});
   c.on("close",()=>{if(net.conn!==c)return;net.conn=null;setNet("Your friend disconnected. Waiting for them to come back");draw();
     if(!net.host){const p=net.peer;setTimeout(()=>{if(net.peer===p&&!net.conn&&net.room){try{p.destroy()}catch(e){}tryHost(0)}},1500)}})}
 async function loadGame(n,swap,mv){
   N=n;cfg.n=n;cfg.swap=!!swap;$("size").value=String(n);$("swap").value=swap?"1":"0";
   const h=[await api("/api/new",{swap:!!swap,n})],ms=[];
   for(const a of mv){h.push(await api("/api/apply",{state:h[h.length-1].state,action:a}));ms.push(a)}
-  hist=h;moves=ms;switches=[];busy=false}
+  hist=h;moves=ms;switches=[];busy=false;net.marks.clear();net.rev=null}
 async function onNet(m){
   if(!m||typeof m!=="object"||!online())return;
   if(m.t==="full"){const p=net.peer;net.peer=null;net.conn=null;net.room=null;if(p){try{p.destroy()}catch(e){}}setNet("That room already has two players");return draw()}
@@ -965,6 +978,11 @@ async function onNet(m){
     if((m.n===9||m.n===11)&&(theirs.length>moves.length||(theirs.length===moves.length&&!net.host&&(m.n!==cfg.n||!!m.swap!==cfg.swap)))){await loadGame(m.n,m.swap,theirs);net.resigned=m.resigned||0}
     setNet("Connected. You are "+(net.color===1?"Red (top to bottom, moves first)":"Blue (left to right)"));return draw()}
   if(m.t==="new"&&(m.n===9||m.n===11)){await loadGame(m.n,m.swap,[]);net.resigned=0;return draw()}
+  if(m.t==="undo"){const k=m.len;if(Number.isInteger(k)&&k>=0&&k<moves.length&&!net.resigned){net.rev=null;moves.length=k;hist.length=k+1;pend=null;setNet("Your friend took back the last move")}return draw()}
+  if(m.t==="hint"){net.hints=Array.isArray(m.a)?m.a.slice(0,60):[];net.hintP=m.len===moves.length&&Number.isInteger(m.p)?m.p:null;return draw()}
+  if(m.t==="side"){if((m.color===1||m.color===2)&&net.color)setColor(3-m.color);return draw()}
+  if(m.t==="view"){net.rev=Number.isInteger(m.k)&&m.k>=0&&m.k<moves.length?m.k:null;return draw()}
+  if(m.t==="chat"){if(typeof m.s==="string"&&m.s.trim())say(false,m.s.slice(0,300));return}
   if(m.t==="resign"){if(!cur().winner)net.resigned=3-net.color;return draw()}
   if(m.t==="move"){
     if(m.i!==moves.length||cur().winner||net.resigned||cur().state.toMove===net.color||!cur().legal.includes(m.a)){
@@ -990,22 +1008,27 @@ const ctr=(r,c)=>[PAD+W/2+c*W+r*W/2,PAD+R+r*H];
 const name=a=>a===SWAP?"swap":String.fromCharCode(65+a%N)+(Math.floor(a/N)+1);
 function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e}
 function draw(){
-  const v=cur(),s=v.state,two=cfg.engine==='human',on=online(),live=!!(net.conn&&net.conn.open),mine=(on?live&&!!net.color&&s.toMove===net.color&&!net.resigned:(two||s.toMove===cfg.human))&&!v.winner&&!busy;
-  if(pend!==null&&(!mine||s.grid[pend]!==0||!$("tap2").checked))pend=null;
+  const two=cfg.engine==='human',on=online(),live=!!(net.conn&&net.conn.open),rev=on&&net.rev!==null?Math.max(0,Math.min(net.rev,moves.length)):null,v=rev===null?cur():hist[rev],s=v.state,mine=(on?live&&!!net.color&&s.toMove===net.color&&!net.resigned&&rev===null&&!net.mark:(two||s.toMove===cfg.human))&&!v.winner&&!busy;
+  const canPoint=on&&live&&!!net.color&&!mine;
+  if(net.seen!==moves.length){net.seen=moves.length;pend=null;net.hintP=null}
+  if(rev===null)for(const m of [...net.marks])if(s.grid[m]!==0)net.marks.delete(m);
+  if(pend!==null&&(s.grid[pend]!==0||!(mine&&$("tap2").checked)))pend=null;
+  const hints=new Set(on&&live?net.hints.filter(a=>Number.isInteger(a)&&a>=0&&a<N*N&&s.grid[a]===0):[]),hintP=on&&live&&rev===null&&Number.isInteger(net.hintP)&&s.grid[net.hintP]===0?net.hintP:null,myM=on?net.marks:new Set();
   svg.setAttribute("viewBox",`0 0 ${PAD*2+W*N+W*(N-1)/2} ${PAD*2+H*(N-1)+2*R}`);svg.textContent="";
   const [a0]=ctr(0,0),[a1]=ctr(0,N-1),[b0,by]=ctr(N-1,0),[b1]=ctr(N-1,N-1);
   svg.append(el("line",{x1:a0,y1:PAD-8,x2:a1,y2:PAD-8,stroke:"var(--red)","stroke-width":5,"stroke-linecap":"round"}),
     el("line",{x1:b0,y1:by+R+8,x2:b1,y2:by+R+8,stroke:"var(--red)","stroke-width":5,"stroke-linecap":"round"}),
     el("line",{x1:a0-W/2-8,y1:PAD+R,x2:b0-W/2-8,y2:by,stroke:"var(--blue)","stroke-width":5,"stroke-linecap":"round"}),
     el("line",{x1:a1+W/2+8,y1:PAD+R,x2:b1+W/2+8,y2:by,stroke:"var(--blue)","stroke-width":5,"stroke-linecap":"round"}));
-  const last=moves.length?moves[moves.length-1]:null,win=new Set(v.winningCells);
+  const ml=rev===null?moves.length:rev,last=ml?moves[ml-1]:null,win=new Set(v.winningCells);
   for(let r=0;r<N;r++)for(let c=0;c<N;c++){
     const i=r*N+c,[x,y]=ctr(r,c),pts=[];for(let k=0;k<6;k++){const t=Math.PI/180*(60*k-30);pts.push((x+R*Math.cos(t)).toFixed(1)+","+(y+R*Math.sin(t)).toFixed(1))}
     const g=s.grid[i],ok=mine&&g===0;
-    const h=el("polygon",{points:pts.join(" "),class:"hex"+(g===1?" r":g===2?" b":"")+(ok?" ok":"")+(ok&&pend===i?" pend":"")+(win.has(i)?" win":"")});
+    const h=el("polygon",{points:pts.join(" "),class:"hex"+(g===1?" r":g===2?" b":"")+(ok?" ok":"")+(canPoint&&g===0?" pt":"")+(g!==0?"":pend===i?" pend":myM.has(i)?(hints.has(i)?" mark both":" mark"):(hints.has(i)||hintP===i)?" peer":"")+(win.has(i)?" win":"")});
     h.append(Object.assign(document.createElementNS(NS,"title"),{textContent:name(i)}));
-    if(ok)h.addEventListener("click",()=>{if(!$("tap2").checked||pend===i){pend=null;human(i)}else{pend=i;draw()}});svg.append(h);
-    if(g&&((last!==null&&last!==SWAP&&last===i)||(last===SWAP&&moves.length===2)))svg.append(el("circle",{cx:x,cy:y,r:6,class:"last"}));
+    if(ok)h.addEventListener("click",()=>{if(!$("tap2").checked||pend===i){pend=null;human(i)}else{pend=i;draw()}});
+    else if(canPoint&&g===0)h.addEventListener("click",()=>{if(net.marks.has(i))net.marks.delete(i);else if(net.marks.size<60)net.marks.add(i);draw()});svg.append(h);
+    if(g&&((last!==null&&last!==SWAP&&last===i)||(last===SWAP&&ml===2)))svg.append(el("circle",{cx:x,cy:y,r:6,class:"last"}));
   }
   for(let c=0;c<N;c++){const [x]=ctr(0,c);const t=el("text",{x,y:PAD-16,class:"lab"});t.textContent=String.fromCharCode(65+c);svg.append(t)}
   for(let r=0;r<N;r++){const [x,y]=ctr(r,0);const t=el("text",{x:x-W/2-20,y:y+4,class:"lab"});t.textContent=r+1;svg.append(t)}
@@ -1015,9 +1038,15 @@ function draw(){
   if(two&&!v.winner)st.className=s.toMove===1?"red":"blue";
   if(on){const me=net.color;st.className=v.winner?(v.winner===1?"red":"blue"):"";
     st.textContent=net.resigned?(net.resigned===me?"You resigned":"Your friend resigned. You win"):v.winner?(v.winner===me?"You win":"Your friend wins")+` (${who(v.winner)})`:!live||!me?"Online game: not connected yet":s.toMove===me?`Your move (${who(me)})`:`Waiting for your friend (${who(3-me)})`;}
+  if(rev!==null){st.className="";st.textContent="Reviewing together: after move "+rev+" of "+moves.length}
   if(pend!==null){st.className="";st.textContent="Tap "+name(pend)+" again to place your stone"}
+  else if(hintP!==null)st.textContent+=". Your friend is pointing at "+name(hintP)
+  else if(hints.size===1)st.textContent+=". Your friend marked "+name([...hints][0])
+  else if(hints.size>1)st.textContent+=". Your friend marked "+hints.size+" cells"
+  if(on&&live&&net.mark&&rev===null&&pend===null)st.textContent+=". Mark mode: taps mark cells"
   $("moves").textContent=moves.map((m,i)=>`${i+1}.${name(m)}`).join("  ");
-  $("swapbtn").hidden=!(mine&&v.legal.includes(SWAP));$("undo").disabled=busy||hist.length<2;$("switch").disabled=busy||!!v.winner||two;$("side").disabled=$("sims").disabled=$("eng").value==="human"||$("eng").value==="online";if(on){$("undo").disabled=$("switch").disabled=true}$("resign").disabled=!on||!live||!!v.winner||!!net.resigned;$("net").hidden=$("eng").value!=="online";
+  $("swapbtn").hidden=!(mine&&v.legal.includes(SWAP));$("undo").disabled=busy||hist.length<2;$("switch").disabled=busy||!!v.winner||two;$("side").disabled=$("sims").disabled=$("eng").value==="human"||$("eng").value==="online";if(on){$("switch").disabled=!live||!net.color;$("undo").disabled=!live||!moves.length||!!net.resigned||rev!==null}$("tools").hidden=!on;$("rvback").disabled=!on||!live||ml===0;$("rvfwd").disabled=$("rvlive").disabled=!on||!live||rev===null;$("markbtn").disabled=!on||!live;$("markbtn").textContent="Mark cells: "+(net.mark?"on":"off");$("markbtn").className=net.mark?"primary":"";$("markbtn").setAttribute("aria-pressed",String(net.mark));$("markclr").disabled=!net.marks.size;$("resign").disabled=!on||!live||!!v.winner||!!net.resigned;$("net").hidden=$("eng").value!=="online";$("chat").hidden=!on;if(rev!==null)$("resign").disabled=true;$("chatsend").disabled=$("chatin").disabled=!on||!live;
+  if(on&&live){if(net.sentTo!==net.conn){net.sentTo=net.conn;net.sent=null}const key=[...net.marks].sort((a,b)=>a-b).join(",")+"|"+pend;if(net.sent!==key){net.sent=key;net.conn.send({t:"hint",a:[...net.marks],p:pend,len:moves.length})}}
 }
 async function engine(){
   const v=cur();if(v.winner||cfg.engine==='human'||online()||v.state.toMove===cfg.human)return draw();
@@ -1028,22 +1057,32 @@ async function engine(){
 }
 let humanLock=false;async function human(a){if(busy||humanLock||!cur().legal.includes(a))return;humanLock=true;try{return await human0(a)}finally{humanLock=false}}
 async function human0(a){if(busy)return;
-  if(online()){if(net.lock||!net.conn||!net.conn.open||cur().state.toMove!==net.color||net.resigned||cur().winner||!cur().legal.includes(a))return;
+  if(online()){if(net.rev!==null||net.lock||!net.conn||!net.conn.open||cur().state.toMove!==net.color||net.resigned||cur().winner||!cur().legal.includes(a))return;
     net.lock=true;try{const o=await api("/api/apply",{state:cur().state,action:a});moves.push(a);hist.push(o);if(net.conn)net.conn.send({t:"move",i:moves.length-1,a})}finally{net.lock=false}return draw()}const o=await api("/api/apply",{state:cur().state,action:a});moves.push(a);hist.push(o);await engine()}
 async function start(){
   N=+$("size").value;cfg={n:N,human:+$("side").value,engine:$("eng").value,sims:+$("sims").value,swap:$("swap").value==="1"};
-  hist=[await api("/api/new",{swap:cfg.swap,n:N})];moves=[];switches=[];$("saved").textContent="";busy=false;net.resigned=0;if(online()&&net.conn&&net.conn.open)net.conn.send({t:"new",n:cfg.n,swap:cfg.swap});await engine();
+  hist=[await api("/api/new",{swap:cfg.swap,n:N})];moves=[];switches=[];$("saved").textContent="";busy=false;net.resigned=0;net.marks.clear();net.rev=null;if(online()&&net.conn&&net.conn.open)net.conn.send({t:"new",n:cfg.n,swap:cfg.swap});await engine();
 }
 $("new").onclick=start;
-$("switch").onclick=()=>{if(busy||cur().winner)return;cfg.human=3-cfg.human;$("side").value=cfg.human;switches.push(moves.length);engine()};$("swapbtn").onclick=()=>human(SWAP);
+$("switch").onclick=()=>{if(online()){if(!net.conn||!net.conn.open||!net.color)return;setColor(3-net.color);net.conn.send({t:"side",color:net.color});return draw()}
+  if(busy||cur().winner)return;cfg.human=3-cfg.human;$("side").value=cfg.human;switches.push(moves.length);engine()};$("swapbtn").onclick=()=>human(SWAP);
 $("eng").onchange=()=>{const o=$("eng").value==="online";if(o||online()){if(!o)netClose();start()}else draw()};
-$("undo").onclick=()=>{if(busy)return;if(cfg.engine==='human'){if(hist.length>1){hist.pop();moves.pop()}return draw()}do{hist.pop();moves.pop()}while(hist.length>1&&cur().state.toMove!==cfg.human);if(cur().state.toMove!==cfg.human)engine();else draw()};
+$("undo").onclick=()=>{if(busy)return;
+  if(online()){if(net.rev!==null||humanLock||net.lock||!net.conn||!net.conn.open||!moves.length||net.resigned)return;
+    moves.pop();hist.pop();pend=null;net.conn.send({t:"undo",len:moves.length});setNet("You took back the last move");return draw()}if(cfg.engine==='human'){if(hist.length>1){hist.pop();moves.pop()}return draw()}do{hist.pop();moves.pop()}while(hist.length>1&&cur().state.toMove!==cfg.human);if(cur().state.toMove!==cfg.human)engine();else draw()};
 $("save").onclick=async()=>{await api("/api/save",{n:cfg.n,human:cfg.human,engine:cfg.engine,sims:cfg.sims,swap:cfg.swap,moves,switches,winner:cur().winner,note:$("note").value});$("saved").textContent="Downloaded "+new Date().toLocaleTimeString()};
 {const t=$("tap2");let v=null;try{v=localStorage.getItem("hextap2")}catch(e){}
   t.checked=v===null?matchMedia("(pointer:coarse)").matches:v==="1";
   t.onchange=()=>{try{localStorage.setItem("hextap2",t.checked?"1":"0")}catch(e){}draw()}}
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState!=="visible"||!online()||!net.room||(net.conn&&net.conn.open))return;
   const p=net.peer;if(!p||p.destroyed||p.disconnected)netConnect()});
+function say(me,s){const l=$("chatlog"),d=document.createElement("div");if(me)d.className="me";d.textContent=(me?"You: ":"Friend: ")+s;l.append(d);while(l.childNodes.length>200)l.firstChild.remove();l.scrollTop=l.scrollHeight}
+function chatSend(){const i=$("chatin"),s=i.value.trim().slice(0,300);if(!s||!online()||!net.conn||!net.conn.open)return;net.conn.send({t:"chat",s});say(true,s);i.value=""}
+$("chatsend").onclick=chatSend;$("chatin").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();chatSend()}});
+function setView(k){if(!online()||!net.conn||!net.conn.open)return;net.rev=k!==null&&k>=0&&k<moves.length?k:null;net.conn.send({t:"view",k:net.rev});draw()}
+$("rvback").onclick=()=>setView((net.rev===null?moves.length:Math.min(net.rev,moves.length))-1);
+$("rvfwd").onclick=()=>{if(net.rev!==null)setView(net.rev+1)};$("rvlive").onclick=()=>setView(null);
+$("markbtn").onclick=()=>{net.mark=!net.mark;pend=null;draw()};$("markclr").onclick=()=>{net.marks.clear();draw()};
 $("connect").onclick=netConnect;
 $("room").addEventListener("keydown",e=>{if(e.key==="Enter")netConnect()});
 $("resign").onclick=()=>{if(!online()||!net.conn||!net.conn.open||cur().winner||net.resigned)return;net.resigned=net.color;net.conn.send({t:"resign"});draw()};
